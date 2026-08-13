@@ -15,11 +15,12 @@ docker run -e FLARESOLVERR_URL=http://localhost:8191/v1 -p 8080:8080 flareproxy
 ```
 
 ## Usage
-Set FlareProxy as a proxy in your browser or in your agent. Please notice: use `http` protocol even if you want to fetch https resources because I'm too lazy to deal with SSL connections. FlareProxy will switch automatically to the https protocol to establish the upstream connection.
+Set FlareProxy as a proxy in your browser, changedetection, or client agent. FlareProxy supports both `http://` and `https://` URLs (via HTTP `CONNECT` tunnel interception with automatic self-signed SSL certificate generation).
+
 ```bash
-curl --proxy 127.0.0.1:8080 http://www.google.com
+curl --proxy 127.0.0.1:8080 https://www.google.com -k
 ```
-You can use it as a proxy in [changedetection](https://github.com/dgtlmoon/changedetection.io), just navigate to settings -> CAPTCHA&Proxies and add it as an extra proxy in the list. Then you can setup your watch using any fetch method.
+You can use it directly as a proxy in [changedetection](https://github.com/dgtlmoon/changedetection.io). Just navigate to settings -> CAPTCHA & Proxies and add `http://flareproxy:8080` (or `http://your-host:8080`) as an extra proxy. You can now use native `https://` links directly without modifying the URL scheme.
 
 ## Docker Compose
 Add the snippet to your docker compose stack, i.e.:

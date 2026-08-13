@@ -1,37 +1,34 @@
 import unittest
 import json
-from unittest.mock import patch, MagicMock, Mock, PropertyMock
-from io import BytesIO
+from unittest.mock import patch, MagicMock
 
 
-class MockFlareSolverrResponse:
-    """Mock response from FlareSolverr"""
-    def __init__(self, status_code=200, response_text="Mock response"):
-        self.status_code = status_code
-        self._json_data = {
-            "solution": {
-                "response": response_text
-            }
-        }
-
-    def json(self):
-        return self._json_data
+def mock_flaresolverr_post(url, headers=None, json=None, timeout=None):
+    cmd = json.get("cmd") if json else None
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    if cmd == "sessions.create":
+        mock_resp.json.return_value = {"session": "test-session-id"}
+    elif cmd == "request.get":
+        mock_resp.json.return_value = {"solution": {"response": "<html>Mock response</html>"}}
+    else:
+        mock_resp.json.return_value = {}
+    return mock_resp
 
 
 class TestFlareProxy(unittest.TestCase):
-    """Basic smoke tests for FlareProxy"""
+    """Test suite for FlareProxy"""
 
-    @patch('flareproxy.requests.post')
+    @patch('flareproxy.requests.post', side_effect=mock_flaresolverr_post)
     def test_do_GET_constructs_url_correctly(self, mock_post):
         """Test that GET requests construct URLs correctly"""
         from flareproxy import ProxyHTTPRequestHandler
-
-        mock_post.return_value = MockFlareSolverrResponse()
 
         with patch.object(ProxyHTTPRequestHandler, '__init__', lambda self, *args, **kwargs: None):
             handler = ProxyHTTPRequestHandler(None, None, None)
             handler.path = "http://example.com/test"
             handler.command = "GET"
+            handler.headers = {}
 
             handler.send_response = MagicMock()
             handler.send_header = MagicMock()
@@ -40,45 +37,67 @@ class TestFlareProxy(unittest.TestCase):
 
             handler.do_GET()
 
-            mock_post.assert_called_once()
-            call_args = mock_post.call_args
-            self.assertEqual(call_args[1]['json']['url'], 'https://example.com/test')
-            self.assertEqual(call_args[1]['json']['cmd'], 'request.get')
+            # Find the call for request.get
+            get_calls = [
+                call for call in mock_post.call_args_list
+                if call[1].get('json', {}).get('cmd') == 'request.get'
+            ]
+            self.assertEqual(len(get_calls), 1)
+            self.assertEqual(get_calls[0][1]['json']['url'], 'https://example.com/test')
 
-    @patch('flareproxy.requests.post')
-    def test_do_CONNECT_returns_error(self, mock_post):
-        """Test that CONNECT requests return a 501 Not Implemented error"""
+    @patch('flareproxy.generate_self_signed_cert')
+    @patch('ssl.SSLContext')
+    @patch('flareproxy.requests.post', side_effect=mock_flaresolverr_post)
+    def test_do_CONNECT_supports_https(self, mock_post, mock_ssl_context, mock_gen_cert):
+        """Test that CONNECT requests perform TLS handshake and handle inner GET request"""
         from flareproxy import ProxyHTTPRequestHandler
 
         with patch.object(ProxyHTTPRequestHandler, '__init__', lambda self, *args, **kwargs: None):
             handler = ProxyHTTPRequestHandler(None, None, None)
-            handler.path = "www.example.com:443"
+            handler.path = "mediamarkt.pl:443"
             handler.command = "CONNECT"
+
+            # Mock connection socket
+            mock_conn = MagicMock()
+            handler.connection = mock_conn
+
+            # Mock SSL socket returned after wrap_socket
+            mock_ssl_sock = MagicMock()
+            # Inner request line over TLS socket
+            mock_ssl_sock.makefile.return_value.readline.return_value = b"GET /pl/category/123 HTTP/1.1\r\n"
+            mock_ssl_context.return_value.wrap_socket.return_value = mock_ssl_sock
 
             handler.send_response = MagicMock()
             handler.send_header = MagicMock()
             handler.end_headers = MagicMock()
             handler.wfile = MagicMock()
 
+            # Mock parse_request to populate path and headers
+            def mock_parse():
+                handler.command = "GET"
+                handler.path = "/pl/category/123"
+                handler.headers = {"Host": "mediamarkt.pl"}
+                return True
+
+            handler.parse_request = mock_parse
+
             handler.do_CONNECT()
 
-            handler.send_response.assert_called_with(501, "Not Implemented")
-            handler.send_header.assert_called_with("Content-Type", "text/plain; charset=utf-8")
-            handler.wfile.write.assert_called_once()
+            # Verify CONNECT response was sent
+            handler.send_response.assert_any_call(200, "Connection Established")
 
-            written_data = handler.wfile.write.call_args[0][0]
-            error_message = written_data.decode('utf-8')
-            self.assertIn('CONNECT method is not supported', error_message)
-            self.assertIn('use HTTP URLs instead', error_message)
+            # Find the call for request.get to FlareSolverr
+            get_calls = [
+                call for call in mock_post.call_args_list
+                if call[1].get('json', {}).get('cmd') == 'request.get'
+            ]
+            self.assertEqual(len(get_calls), 1)
+            self.assertEqual(get_calls[0][1]['json']['url'], 'https://mediamarkt.pl/pl/category/123')
 
-            mock_post.assert_not_called()
-
-    @patch('flareproxy.requests.post')
+    @patch('flareproxy.requests.post', side_effect=mock_flaresolverr_post)
     def test_handle_get_request_includes_timeout(self, mock_post):
         """Test that requests include maxTimeout parameter"""
         from flareproxy import ProxyHTTPRequestHandler
-
-        mock_post.return_value = MockFlareSolverrResponse()
 
         with patch.object(ProxyHTTPRequestHandler, '__init__', lambda self, *args, **kwargs: None):
             handler = ProxyHTTPRequestHandler(None, None, None)
@@ -90,8 +109,12 @@ class TestFlareProxy(unittest.TestCase):
 
             handler.handle_get_request("https://example.com")
 
-            call_args = mock_post.call_args
-            self.assertEqual(call_args[1]['json']['maxTimeout'], 60000)
+            get_calls = [
+                call for call in mock_post.call_args_list
+                if call[1].get('json', {}).get('cmd') == 'request.get'
+            ]
+            self.assertEqual(len(get_calls), 1)
+            self.assertEqual(get_calls[0][1]['json']['maxTimeout'], 60000)
 
     @patch('flareproxy.requests.post')
     def test_error_handling(self, mock_post):
@@ -118,8 +141,7 @@ class TestFlareProxy(unittest.TestCase):
             self.assertIn('error', error_json)
             self.assertIn('Connection failed', error_json['error'])
 
-    @patch('flareproxy.requests.post')
-    def test_flaresolverr_url_env_default(self, mock_post):
+    def test_flaresolverr_url_env_default(self):
         """Test that FLARESOLVERR_URL defaults correctly"""
         import flareproxy
 

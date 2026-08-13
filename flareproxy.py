@@ -4,11 +4,73 @@ import re
 import time
 import hashlib
 import urllib.parse
+import ssl
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 import socket
 
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr:8191/v1")
+CERT_FILE = os.getenv("SSL_CERT_FILE", "cert.pem")
+KEY_FILE = os.getenv("SSL_KEY_FILE", "key.pem")
+
+
+def generate_self_signed_cert(cert_path=CERT_FILE, key_path=KEY_FILE):
+    """Generate self-signed certificate if cert and key files do not exist."""
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return
+
+    # Try using cryptography package
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        import datetime
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "FlareProxy")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+            .sign(key, hashes.SHA256())
+        )
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        print(f"Generated self-signed certificate: {cert_path}, {key_path}")
+        return
+    except ImportError:
+        pass
+
+    # Try using openssl CLI
+    import subprocess
+    try:
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_path, "-out", cert_path,
+            "-days", "3650", "-nodes", "-subj", "/CN=FlareProxy"
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"Generated self-signed certificate using openssl: {cert_path}, {key_path}")
+        return
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not generate self-signed SSL certificate. Please install 'cryptography' "
+        f"or 'openssl', or manually place '{cert_path}' and '{key_path}' in the working directory."
+    )
+
 
 def solve_pow(data: str, difficulty: int):
     required_zero_bytes = difficulty // 2
@@ -119,6 +181,7 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(bytes(html, "utf-8"))
+            self.wfile.flush()
 
         except Exception as e:
             self.send_response(500)
@@ -126,6 +189,7 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             error_message = json.dumps({"error": str(e)})
             self.wfile.write(error_message.encode("utf-8"))
+            self.wfile.flush()
         finally:
             if session_id:
                 try:
@@ -134,25 +198,54 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                     pass
 
     def do_GET(self):
-        url = self.path.replace("http://", "https://")
+        url = self.path
+        if url.startswith("http://"):
+            url = "https://" + url[7:]
+        elif not url.startswith("https://"):
+            host_header = self.headers.get("Host", "")
+            if host_header:
+                url = f"https://{host_header}{url}"
         self.handle_get_request(url)
 
     def do_CONNECT(self):
-        self.send_response(501, "Not Implemented")
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        target_host = self.path.split(":")[0]
+
+        self.send_response(200, "Connection Established")
         self.end_headers()
-        error_message = (
-            "CONNECT method is not supported by FlareProxy.\n\n"
-            "Please use HTTP URLs instead of HTTPS URLs in your client configuration.\n"
-            "Example: http://www.discogs.com/sell/release/265683\n\n"
-            "The proxy will automatically convert HTTP requests to HTTPS when forwarding to FlareSolverr, "
-            "so your requests will still be secure.\n"
-        )
-        self.wfile.write(error_message.encode("utf-8"))
+
+        try:
+            generate_self_signed_cert()
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+            ssl_sock = ssl_context.wrap_socket(self.connection, server_side=True)
+        except Exception as e:
+            print(f"SSL handshake failed for {self.path}: {e}")
+            return
+
+        self.connection = ssl_sock
+        self.rfile = ssl_sock.makefile("rb")
+        self.wfile = ssl_sock.makefile("wb")
+
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if not self.raw_requestline:
+                return
+            if not self.parse_request():
+                return
+
+            url = self.path
+            if not (url.startswith("http://") or url.startswith("https://")):
+                host_header = self.headers.get("Host", target_host)
+                url = f"https://{host_header}{url}"
+
+            self.handle_get_request(url)
+        except Exception as e:
+            print(f"Error handling request inside CONNECT tunnel: {e}")
 
 
 if __name__ == "__main__":
+    generate_self_signed_cert()
     server_address = ("", 8080)
     httpd = HTTPServer(server_address, ProxyHTTPRequestHandler)
-    print("FlareProxy adapter running on port 8080")
+    print("FlareProxy adapter running on port 8080 (HTTP & HTTPS CONNECT supported)")
     httpd.serve_forever()
